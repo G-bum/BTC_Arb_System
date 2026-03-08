@@ -1,57 +1,89 @@
 use futures_util::StreamExt;
-use rusqlite::Connection;
 use serde::Deserialize;
-use tokio_tungstenite::connect_async;
+use std::time::{SystemTime, UNIX_EPOCH};
+use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 
-#[derive(Deserialize, Debug)]
-struct OrderBook {
+// --- 데이터 구조 정의 ---
+#[derive(Debug, Deserialize)]
+struct DepthStream {
+    stream: String,
+    data: DepthData,
+}
+
+#[derive(Debug, Deserialize)]
+struct DepthData {
     #[serde(rename = "b")]
     bids: Vec<Vec<String>>,
     #[serde(rename = "a")]
     asks: Vec<Vec<String>>,
+    #[serde(rename = "E")]
+    event_time: u64,
 }
 
 #[tokio::main]
 async fn main() {
-    // 1. 데이터 저장 경로 설정 (선생님이 정하신 01Ab 폴더)
-    let db_path = "C:/BTC_Arb/01/01A/01Ab/01Ab01price.db"; 
-    let conn = Connection::open(db_path).expect("DB 연결 실패");
+    // 수집 대상 설정
+    let url = "wss://dstream.binance.com/stream?streams=btcusd_perp@depth5/btcusd_260327@depth5/btcusd_260626@depth5";
 
-    // 2. 테이블 생성 (데이터를 담을 그릇)
-    conn.execute(
-        "CREATE TABLE IF NOT EXISTS price (
-            id INTEGER PRIMARY KEY,
-            time TEXT,
-            bid_price REAL,
-            ask_price REAL
-        )",
-        [],
-    ).unwrap();
-
-    println!("🚀 바이낸스 실시간 호가 수집 시작... (저장소: 01Ab01price.db)");
-
-    // 3. 바이낸스 웹소켓 연결 (BTC 선물 5단계 호가)
-    let url = "wss://fstream.binance.com/ws/btcusdt@depth5@100ms";
-    let (ws_stream, _) = connect_async(url).await.expect("바이낸스 연결 실패");
+    let (ws_stream, _) = connect_async(url).await.expect("연결 실패");
     let (_, mut read) = ws_stream.split();
 
-    while let Some(message) = read.next().await {
-        if let Ok(msg) = message {
-            if let Ok(text) = msg.to_text() {
-                if let Ok(data) = serde_json::from_str::<OrderBook>(text) {
-                    let bid = data.bids[0][0].parse::<f64>().unwrap_or(0.0);
-                    let ask = data.asks[0][0].parse::<f64>().unwrap_or(0.0);
-                    let now = chrono::Local::now().format("%Y-%m-%d %H:%M:%S").to_string();
+    println!("🚀 [UTC 기준] 선물 3종 5호가 실시간 수집 시작...");
 
-                    // 4. DB에 저장
-                    let _ = conn.execute(
-                        "INSERT INTO price (time, bid_price, ask_price) VALUES (?1, ?2, ?3)",
-                        (&now, &bid, &ask),
-                    );
-
-                    println!("[{}] 매수: {} | 매도: {}", now, bid, ask);
-                }
+    while let Some(Ok(msg)) = read.next().await {
+        if let Message::Text(text) = msg {
+            if let Ok(depth) = serde_json::from_str::<DepthStream>(&text) {
+                print_depth_info(depth);
             }
         }
+    }
+}
+
+fn print_depth_info(depth: DepthStream) {
+    let now_system = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    let total_ms = now_system.as_millis() as u64;
+    
+    // --- 🌐 세계 표준시(UTC) 계산 ---
+    let total_secs = total_ms / 1000;
+    let hour = (total_secs / 3600) % 24; 
+    let min = (total_secs / 60) % 60;
+    let sec = total_secs % 60;
+    let ms = total_ms % 1000;
+
+    // --- 🏷️ 별명(Alias) 부여 ---
+    let role = match depth.stream.as_str() {
+        s if s.contains("perp") => "[스왑]",
+        s if s.contains("260327") => "[당분기]",
+        s if s.contains("260626") => "[차분기]",
+        _ => "[기타]",
+    };
+
+    let delay = if total_ms > depth.data.event_time {
+        total_ms - depth.data.event_time
+    } else {
+        0
+    };
+
+    println!("\n[UTC {:02}:{:02}:{:02}.{:03}] {} | 지연: {}ms", hour, min, sec, ms, role, delay);
+    println!("--------------------------------------------------");
+
+    // 매수 5호가 및 누적 수량 출력 (슬리피지 확인용)
+    let mut bid_accum = 0.0;
+    println!("  <매수 5호가>");
+    for (i, bid) in depth.data.bids.iter().enumerate() {
+        let price: f64 = bid[0].parse().unwrap_or(0.0);
+        let qty: f64 = bid[1].parse().unwrap_or(0.0);
+        bid_accum += qty;
+        println!("    {}호가: {} | 수량: {:.3} | 누적: {:.3}", i+1, price, qty, bid_accum);
+    }
+
+    // 매도 5호가 및 누적 수량 출력
+    let mut ask_accum = 0.0;
+    println!("  <매도 5호가>");
+    for (i, ask) in depth.data.asks.iter().enumerate() {
+        let price: f64 = ask[0].parse().unwrap_or(0.0);
+        let qty: f64 = ask[1].parse().unwrap_or(0.0);
+        ask_accum += qty;
+        println!("    {}호가: {} | 수량: {:.3} | 누적: {:.3}", i+1, price, qty, ask_accum);
     }
 }
