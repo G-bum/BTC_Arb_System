@@ -137,7 +137,8 @@ fn insert_snapshot(conn: &Connection, snap: &Snapshot58) {
 }
 
 fn init_db() -> Connection {
-    let conn = Connection::open("arb_trading.db").expect("DB 파일 생성 실패");
+    // 접두어 규칙 적용된 파일명으로 수정
+    let conn = Connection::open("AAb_TRADING_DATA.db").expect("AAb_TRADING_DATA.db 파일 생성 실패");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY,
@@ -175,7 +176,8 @@ fn init_db() -> Connection {
 }
 
 fn get_active_symbols() -> (String, String) {
-    let file = File::open("symbols.txt").expect("symbols.txt 파일이 없습니다.");
+    // 접두어 규칙 적용된 파일명으로 수정
+    let file = File::open("AAd_SYMBOLS.txt").expect("AAd_SYMBOLS.txt 파일이 없습니다.");
     let reader = BufReader::new(file);
     let mut valid_codes = Vec::new();
     for line in reader.lines() {
@@ -192,7 +194,7 @@ async fn main() {
     let conn = init_db(); // DB 연결 유지
     let (current, next) = get_active_symbols();
     
-    println!("🚀 [황금 수식 & DB 저장 모드] 가동");
+    println!("🚀 [시스템 가동] 명칭 및 접두어 적용 완료");
     
     let url = format!("wss://dstream.binance.com/stream?streams=btcusd_perp@depth5/{}@depth5/{}@depth5", current, next);
     let (ws_stream, _) = connect_async(&url).await.expect("연결 실패");
