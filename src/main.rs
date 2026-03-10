@@ -7,7 +7,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use rusqlite::{params, Connection, ToSql};
 use chrono::{Timelike, Utc};
 
-#[derive(Debug, Deserialize, Clone)] // Clone 추가
+#[derive(Debug, Deserialize, Clone)]
 struct DepthStream {
     stream: String,
     data: DepthData,
@@ -34,8 +34,7 @@ struct Snapshot58 {
     sprd_ask: [f64; 5], sprd_bid: [f64; 5],
 }
 
-// 30개 차익거래 지표 연산 (기범 선생님 황금 수식 적용)
-// 수식: (Far - Near) / ((Far + Near) / 2.0) * 100.0
+// 교차 호가(Cross-Price)를 적용한 지표 계산 함수
 fn calculate_metrics(
     swap: &Option<DepthData>,
     curr: &Option<DepthData>,
@@ -68,24 +67,24 @@ fn calculate_metrics(
     };
 
     for i in 0..5 {
-        let swap_a = get_p(swap, true, i);
-        let swap_b = get_p(swap, false, i);
-        let curr_a = get_p(curr, true, i);
-        let curr_b = get_p(curr, false, i);
-        let next_a = get_p(next, true, i);
-        let next_b = get_p(next, false, i);
+        let swap_a = get_p(swap, true, i);  // 스왑 매도
+        let swap_b = get_p(swap, false, i); // 스왑 매수
+        let curr_a = get_p(curr, true, i);  // 당분기 매도
+        let curr_b = get_p(curr, false, i); // 당분기 매수
+        let next_a = get_p(next, true, i);  // 차분기 매도
+        let next_b = get_p(next, false, i); // 차분기 매수
 
-        // 당분기 베이시스 (Far: 당분기, Near: 스왑)
-        cur_basis_ask[i] = calc(curr_a, swap_a);
-        cur_basis_bid[i] = calc(curr_b, swap_b);
+        // 당분기 베이시스: (당분기 매도 - 스왑 매수) / (당분기 매수 - 스왑 매도)
+        cur_basis_ask[i] = calc(curr_a, swap_b);
+        cur_basis_bid[i] = calc(curr_b, swap_a);
 
-        // 차분기 베이시스 (Far: 차분기, Near: 스왑)
-        nxt_basis_ask[i] = calc(next_a, swap_a);
-        nxt_basis_bid[i] = calc(next_b, swap_b);
+        // 차분기 베이시스: (차분기 매도 - 스왑 매수) / (차분기 매수 - 스왑 매도)
+        nxt_basis_ask[i] = calc(next_a, swap_b);
+        nxt_basis_bid[i] = calc(next_b, swap_a);
 
-        // 스프레드 (Far: 차분기, Near: 당분기)
-        sprd_ask[i] = calc(next_a, curr_a);
-        sprd_bid[i] = calc(next_b, curr_b);
+        // 스프레드: (차분기 매도 - 당분기 매수) / (차분기 매수 - 당분기 매도)
+        sprd_ask[i] = calc(next_a, curr_b);
+        sprd_bid[i] = calc(next_b, curr_a);
     }
 
     (cur_basis_ask, cur_basis_bid, nxt_basis_ask, nxt_basis_bid, sprd_ask, sprd_bid)
@@ -98,13 +97,19 @@ fn get_depth_arrays(depth: &Option<DepthData>) -> ([f64; 5], [f64; 5], [f64; 5],
     let mut bid_q = [0.0; 5];
     
     if let Some(d) = depth {
+        let mut ask_accum = 0.0;
         for (i, v) in d.asks.iter().take(5).enumerate() {
             ask_p[i] = v[0].parse().unwrap_or(0.0);
-            ask_q[i] = v[1].parse().unwrap_or(0.0);
+            let qty: f64 = v[1].parse().unwrap_or(0.0);
+            ask_accum += qty;
+            ask_q[i] = ask_accum;
         }
+        let mut bid_accum = 0.0;
         for (i, v) in d.bids.iter().take(5).enumerate() {
             bid_p[i] = v[0].parse().unwrap_or(0.0);
-            bid_q[i] = v[1].parse().unwrap_or(0.0);
+            let qty: f64 = v[1].parse().unwrap_or(0.0);
+            bid_accum += qty;
+            bid_q[i] = bid_accum;
         }
     }
     (ask_p, ask_q, bid_p, bid_q)
@@ -137,8 +142,7 @@ fn insert_snapshot(conn: &Connection, snap: &Snapshot58) {
 }
 
 fn init_db() -> Connection {
-    // 접두어 규칙 적용된 파일명으로 수정
-    let conn = Connection::open("AAb_TRADING_DATA.db").expect("AAb_TRADING_DATA.db 파일 생성 실패");
+    let conn = Connection::open("TRADING_DATA.db").expect("TRADING_DATA.db 파일 생성 실패");
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY,
@@ -176,8 +180,7 @@ fn init_db() -> Connection {
 }
 
 fn get_active_symbols() -> (String, String) {
-    // 접두어 규칙 적용된 파일명으로 수정
-    let file = File::open("AAd_SYMBOLS.txt").expect("AAd_SYMBOLS.txt 파일이 없습니다.");
+    let file = File::open("SYMBOLS.txt").expect("SYMBOLS.txt 파일이 없습니다.");
     let reader = BufReader::new(file);
     let mut valid_codes = Vec::new();
     for line in reader.lines() {
@@ -191,16 +194,15 @@ fn get_active_symbols() -> (String, String) {
 
 #[tokio::main]
 async fn main() {
-    let conn = init_db(); // DB 연결 유지
+    let conn = init_db(); 
     let (current, next) = get_active_symbols();
     
-    println!("🚀 [시스템 가동] 명칭 및 접두어 적용 완료");
+    println!("🚀 [시스템 가동] 실거래 교차 호가 수식 적용 완료");
     
     let url = format!("wss://dstream.binance.com/stream?streams=btcusd_perp@depth5/{}@depth5/{}@depth5", current, next);
     let (ws_stream, _) = connect_async(&url).await.expect("연결 실패");
     let (_, mut read) = ws_stream.split();
 
-    // 실시간 계산 및 스냅샷을 위해 상태를 기억할 변수
     let mut last_current_bid = 0.0;
     let mut last_next_bid = 0.0;
     
@@ -209,7 +211,6 @@ async fn main() {
     let mut last_next_depth: Option<DepthData> = None;
     let mut last_snapshot_min = Utc::now().minute();
     
-    // [추가] 처음 앱 실행 시 즉시 스냅샷을 남기기 위한 상태 (true면 즉시 저장)
     let mut is_first_run = true;
 
     while let Some(Ok(msg)) = read.next().await {
@@ -218,7 +219,6 @@ async fn main() {
                 let bid1: f64 = depth.data.bids[0][0].parse().unwrap_or(0.0);
                 let ask1: f64 = depth.data.asks[0][0].parse().unwrap_or(0.0);
                 
-                // 상품별 가격 및 전체 데이터 업데이트
                 if depth.stream.contains("perp") { last_swap_depth = Some(depth.data.clone()); }
                 else if depth.stream.contains(&current) { 
                     last_current_bid = bid1; 
@@ -229,33 +229,20 @@ async fn main() {
                     last_next_depth = Some(depth.data.clone()); 
                 }
 
-                // --- 58분 정각 및 최초 실행 시 스냅샷 저장 로직 ---
                 let now_utc = Utc::now();
-                // 3가지 상품 데이터가 모두 들어와있어야 저장 가능
                 let has_all_depths = last_swap_depth.is_some() && last_curr_depth.is_some() && last_next_depth.is_some();
-                
-                // (1) 58분 00초 정각인가?
                 let is_58min = now_utc.minute() == 58 && now_utc.second() == 0 && last_snapshot_min != 58;
                 
-                // 최초 실행이거나 정각 58분일 때 저장
                 if has_all_depths && (is_first_run || is_58min) {
                     if is_58min {
                         last_snapshot_min = 58;
                     }
                     
-                    if is_first_run {
-                        println!("📸 즉시 스냅샷 1회 기록 시작!");
-                    } else {
-                        println!("📸 58분 00초 정각 스냅샷 기록 시작!");
-                    }
-                    
                     let metrics = calculate_metrics(&last_swap_depth, &last_curr_depth, &last_next_depth);
                     let ts_utc = now_utc.timestamp() as u64;
-
-                    // 공통 지표
                     let (c_ask, c_bid, n_ask, n_bid, s_ask, s_bid) = metrics;
 
-                    // (1) 스왑 스냅샷
+                    // 스왑 스냅샷
                     let (a_p, a_q, b_p, b_q) = get_depth_arrays(&last_swap_depth);
                     insert_snapshot(&conn, &Snapshot58 {
                         ts_utc, category: "SWAP".to_string(),
@@ -264,7 +251,7 @@ async fn main() {
                         nxt_basis_ask: n_ask, nxt_basis_bid: n_bid, sprd_ask: s_ask, sprd_bid: s_bid
                     });
 
-                    // (2) 당분기 스냅샷
+                    // 당분기 스냅샷
                     let (a_p, a_q, b_p, b_q) = get_depth_arrays(&last_curr_depth);
                     insert_snapshot(&conn, &Snapshot58 {
                         ts_utc, category: current.clone(),
@@ -273,7 +260,7 @@ async fn main() {
                         nxt_basis_ask: n_ask, nxt_basis_bid: n_bid, sprd_ask: s_ask, sprd_bid: s_bid
                     });
 
-                    // (3) 차분기 스냅샷
+                    // 차분기 스냅샷
                     let (a_p, a_q, b_p, b_q) = get_depth_arrays(&last_next_depth);
                     insert_snapshot(&conn, &Snapshot58 {
                         ts_utc, category: next.clone(),
@@ -282,33 +269,24 @@ async fn main() {
                         nxt_basis_ask: n_ask, nxt_basis_bid: n_bid, sprd_ask: s_ask, sprd_bid: s_bid
                     });
                     
-                    if is_first_run {
-                        println!("✨ 스냅샷 3종 저장 완료! (사유: 최초 실행)");
-                        is_first_run = false; // 플래그 끄기 (다시는 타지 않도록)
-                    } else {
-                        println!("✨ 스냅샷 3종 저장 완료! (사유: 58분 정각)");
-                    }
-                    
+                    is_first_run = false;
                 } else if now_utc.minute() != 58 {
                     last_snapshot_min = now_utc.minute();
                 }
 
-                // --- 💎 기범 선생님의 황금 수식 적용 ---
                 let mut spread_rate = 0.0;
                 if last_current_bid > 0.0 && last_next_bid > 0.0 {
                     let diff = last_next_bid - last_current_bid;
                     let avg = (last_next_bid + last_current_bid) / 2.0;
-                    spread_rate = (diff / avg) * 100.0; // 선생님의 수식 그대로!
+                    spread_rate = (diff / avg) * 100.0; 
                 }
 
-                // DB에 저장
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
                 conn.execute(
                     "INSERT INTO trades (time, category, bid1_price, ask1_price, spread_rate) VALUES (?1, ?2, ?3, ?4, ?5)",
                     params![now, depth.stream, bid1, ask1, spread_rate],
                 ).expect("데이터 저장 실패");
 
-                // 5호가 출력
                 print_depth_info(depth, &current, &next);
             }
         }
@@ -327,7 +305,6 @@ fn print_depth_info(depth: DepthStream, current: &str, next: &str) {
              (t/3600)%24, (t/60)%60, t%60, role);
     println!("--------------------------------------------------");
 
-    // 1. 매도 호가 출력 (Asks) + 누적 계산
     let mut ask_accum = 0.0;
     for (i, ask) in depth.data.asks.iter().take(5).enumerate() {
         let price: f64 = ask[0].parse().unwrap_or(0.0);
@@ -338,7 +315,6 @@ fn print_depth_info(depth: DepthStream, current: &str, next: &str) {
 
     println!("  -- (현재가) --");
 
-    // 2. 매수 호가 출력 (Bids) + 누적 계산
     let mut bid_accum = 0.0;
     for (i, bid) in depth.data.bids.iter().take(5).enumerate() {
         let price: f64 = bid[0].parse().unwrap_or(0.0);
