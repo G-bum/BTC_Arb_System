@@ -1,4 +1,0 @@
-/target
-**/*.db
-*.exe
-Cargo.lock
