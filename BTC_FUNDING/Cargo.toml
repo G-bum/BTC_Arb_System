@@ -1,0 +1,31 @@
+[package]
+name = "btc_funding"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+
+# 비동기 실행 환경
+
+tokio = { version = "1", features = ["full"] }
+
+# API 요청용 라이브러리
+
+reqwest = { version = "0.11", features = ["json"] }
+
+# 데이터베이스 관리
+
+rusqlite = { version = "0.31.0", features = ["bundled"] }
+
+# 시간 처리
+
+chrono = { version = "0.4", features = ["serde"] }
+
+# 데이터 파싱
+
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# 에러 관리
+
+anyhow = "1.0"

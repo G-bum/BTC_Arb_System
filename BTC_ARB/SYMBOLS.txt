@@ -1,0 +1,17 @@
+# 2026년 분기별 코드
+btcusd_260327
+btcusd_260626
+btcusd_260925
+btcusd_261225
+
+# 2027년 분기별 코드
+btcusd_270326
+btcusd_270625
+btcusd_270924
+btcusd_271231
+
+# 2028년 분기별 코드
+btcusd_280331
+btcusd_280630
+btcusd_280929
+btcusd_281229

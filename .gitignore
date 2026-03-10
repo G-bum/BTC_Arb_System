@@ -1,0 +1,21 @@
+Rust build artifacts
+
+**/target/
+**/*.rs.bk
+
+Database files
+
+**/.db
+**/.db-journal
+
+IDE and temporary files
+
+.tmp.driveupload/
+.tmp.drivedownload/
+.idea/
+.vscode/
+
+OS files
+
+Thumbs.db
+Desktop.ini
