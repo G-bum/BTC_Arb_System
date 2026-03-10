@@ -110,8 +110,6 @@ fn insert_snapshot(conn: &Connection, snap: &Snapshot58) {
 
 fn init_db() -> Connection {
     let conn = Connection::open("TRADING_DATA.db").expect("DB 연결 실패");
-    
-    // trades 테이블: 5호가 가격 및 5호가 합계 수량(q5) 저장 구조로 변경
     conn.execute(
         "CREATE TABLE IF NOT EXISTS trades (
             id INTEGER PRIMARY KEY,
@@ -150,6 +148,56 @@ fn init_db() -> Connection {
     conn
 }
 
+// (추가) 선별 삭제 및 다운샘플링 함수
+fn cleanup_database(conn: &Connection) -> rusqlite::Result<()> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+    
+    // 시간 기준 (초 단위)
+    let one_hour = 3600;
+    let one_day = 86400;
+    let seven_days = 604800;
+
+    println!("🧹 [데이터 정리 시작] 현재 시각 기준 선별 삭제를 수행합니다...");
+
+    // 1. 7일 넘은 것 완전 삭제
+    let del1 = conn.execute(
+        "DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1",
+        params![(now - seven_days).to_string()],
+    )?;
+
+    // 2. 1일 ~ 7일 사이: 10분(600초) 단위로 1개만 남기고 삭제
+    let del2 = conn.execute(
+        "DELETE FROM trades 
+         WHERE CAST(time AS INTEGER) < ?1 
+         AND CAST(time AS INTEGER) >= ?2
+         AND id NOT IN (
+             SELECT MIN(id) FROM trades 
+             WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2
+             GROUP BY (CAST(time AS INTEGER) / 600)
+         )",
+        params![(now - one_day).to_string(), (now - seven_days).to_string()],
+    )?;
+
+    // 3. 1시간 ~ 1일 사이: 1분(60초) 단위로 1개만 남기고 삭제
+    let del3 = conn.execute(
+        "DELETE FROM trades 
+         WHERE CAST(time AS INTEGER) < ?1 
+         AND CAST(time AS INTEGER) >= ?2
+         AND id NOT IN (
+             SELECT MIN(id) FROM trades 
+             WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2
+             GROUP BY (CAST(time AS INTEGER) / 60)
+         )",
+        params![(now - one_hour).to_string(), (now - one_day).to_string()],
+    )?;
+
+    println!("✅ 정리 완료: (7일경과: {}건, 1일~7일샘플링: {}건, 1시간~1일샘플링: {}건)", del1, del2, del3);
+    
+    // 물리적 공간 반환
+    conn.execute("VACUUM", [])?;
+    Ok(())
+}
+
 fn get_active_symbols() -> (String, String) {
     let file = File::open("SYMBOLS.txt").expect("SYMBOLS.txt 파일 없음");
     let reader = BufReader::new(file);
@@ -165,13 +213,15 @@ fn get_active_symbols() -> (String, String) {
 async fn main() {
     let conn = init_db();
     let (current, next) = get_active_symbols();
-    println!("🚀 [5호가 연산 및 합계수량 저장 모드] 가동");
+    println!("🚀 [5호가 연산 & 매시 15분 선별삭제 모드] 가동");
+
+    // 시작 시 1회 정리 수행
+    let _ = cleanup_database(&conn);
     
     let url = format!("wss://dstream.binance.com/stream?streams=btcusd_perp@depth5/{}@depth5/{}@depth5", current, next);
     let (ws_stream, _) = connect_async(&url).await.expect("연결 실패");
     let (_, mut read) = ws_stream.split();
 
-    // 5호가 연산을 위해 각 시장의 최신 5호가 가격 상태 저장용
     let mut last_swap_ask5 = 0.0; let mut last_swap_bid5 = 0.0;
     let mut last_curr_ask5 = 0.0; let mut last_curr_bid5 = 0.0;
     let mut last_next_ask5 = 0.0; let mut last_next_bid5 = 0.0;
@@ -180,19 +230,16 @@ async fn main() {
     let mut last_curr_depth: Option<DepthData> = None;
     let mut last_next_depth: Option<DepthData> = None;
     let mut last_snapshot_min = Utc::now().minute();
+    let mut last_cleanup_hour = -1i32; // 삭제 실행 시간 기록용
     let mut is_first_run = true;
 
     while let Some(Ok(msg)) = read.next().await {
         if let Message::Text(text) = msg {
             if let Ok(depth) = serde_json::from_str::<DepthStream>(&text) {
-                // 현재 데이터의 5호가 배열 추출 (가격 및 누적 수량 포함)
                 let (ap, aq, bp, bq) = get_depth_arrays(&Some(depth.data.clone()));
-                let cur_ask5 = ap[4]; // 매도 5호가 가격
-                let cur_bid5 = bp[4]; // 매수 5호가 가격
-                let cur_aq5 = aq[4];  // 매도 5호가 합계 수량
-                let cur_bq5 = bq[4];  // 매수 5호가 합계 수량
+                let cur_ask5 = ap[4]; let cur_bid5 = bp[4];
+                let cur_aq5 = aq[4];  let cur_bq5 = bq[4];
 
-                // 최신 5호가 상태 업데이트
                 if depth.stream.contains("perp") { 
                     last_swap_bid5 = cur_bid5; last_swap_ask5 = cur_ask5;
                     last_swap_depth = Some(depth.data.clone()); 
@@ -205,10 +252,17 @@ async fn main() {
                 }
 
                 let now_utc = Utc::now();
+                
+                // (1) 매시 15분 선별 삭제 트리거
+                if now_utc.minute() == 15 && last_cleanup_hour != now_utc.hour() as i32 {
+                    let _ = cleanup_database(&conn);
+                    last_cleanup_hour = now_utc.hour() as i32;
+                }
+
+                // (2) 58분 정기 스냅샷 처리
                 let has_all_depths = last_swap_depth.is_some() && last_curr_depth.is_some() && last_next_depth.is_some();
                 let is_58min = now_utc.minute() == 58 && now_utc.second() == 0 && last_snapshot_min != 58;
                 
-                // (1) 58분 정기 스냅샷 처리
                 if has_all_depths && (is_first_run || is_58min) {
                     if is_58min { last_snapshot_min = 58; }
                     let metrics = calculate_metrics(&last_swap_depth, &last_curr_depth, &last_next_depth);
@@ -229,19 +283,17 @@ async fn main() {
                     is_first_run = false;
                 } else if now_utc.minute() != 58 { last_snapshot_min = now_utc.minute(); }
 
-                // (2) 실시간 5호가 기준 교차 연산 로직
                 let calc = |far: f64, near: f64| -> f64 {
                     if far > 0.0 && near > 0.0 { (far - near) / ((far + near) / 2.0) * 100.0 } else { 0.0 }
                 };
 
-                let cur_basis_ask = calc(last_curr_ask5, last_swap_bid5); // 당분기 매도5 - 스왑 매수5
-                let cur_basis_bid = calc(last_curr_bid5, last_swap_ask5); // 당분기 매수5 - 스왑 매도5
-                let nxt_basis_ask = calc(last_next_ask5, last_swap_bid5); // 차분기 매도5 - 스왑 매수5
-                let nxt_basis_bid = calc(last_next_bid5, last_swap_ask5); // 차분기 매수5 - 스왑 매도5
-                let sprd_ask = calc(last_next_ask5, last_curr_bid5);     // 차분기 매도5 - 당분기 매수5
-                let sprd_bid = calc(last_next_bid5, last_curr_ask5);     // 차분기 매수5 - 당분기 매도5
+                let cur_basis_ask = calc(last_curr_ask5, last_swap_bid5);
+                let cur_basis_bid = calc(last_curr_bid5, last_swap_ask5);
+                let nxt_basis_ask = calc(last_next_ask5, last_swap_bid5);
+                let nxt_basis_bid = calc(last_next_bid5, last_swap_ask5);
+                let sprd_ask = calc(last_next_ask5, last_curr_bid5);
+                let sprd_bid = calc(last_next_bid5, last_curr_ask5);
 
-                // (3) 실시간 trades 테이블 저장 (5호가 가격 및 합계수량 포함)
                 let now_ts = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs().to_string();
                 conn.execute(
                     "INSERT INTO trades (time, category, bid5_price, ask5_price, ask_q5, bid_q5, cur_basis_ask, cur_basis_bid, nxt_basis_ask, nxt_basis_bid, sprd_ask, sprd_bid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
