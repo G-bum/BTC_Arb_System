@@ -19,3 +19,7 @@ OS files
 
 Thumbs.db
 Desktop.ini
+
+# API Key file
+KEYS.txt
+**/KEYS.txt
