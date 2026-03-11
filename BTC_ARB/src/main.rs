@@ -234,10 +234,19 @@ async fn main() {
                 },
                 DbCommand::Cleanup => {
                     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-                    println!("🧹 [DB 정리] 3단계 선별 삭제 및 VACUUM 실행");
+                    println!("🧹 [DB 정리] 가이드 기반 선별 삭제(1h 보존, 1d-1m, 7d-10m) 및 VACUUM 실행 중...");
+                    
+                    // 1. 7일(604800초) 초과 데이터: 완전 삭제
                     let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1", params![(now - 604800).to_string()]);
-                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 GROUP BY (CAST(time AS INTEGER) / 600), category)", params![(now - 7200).to_string(), (now - 604800).to_string()]);
-                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) >= ?1 AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) >= ?1 GROUP BY (CAST(time AS INTEGER) / 60), category)", params![(now - 7200).to_string()]);
+                    
+                    // 2. 1일(86400초) ~ 7일(604800초) 사이: 10분(600초)당 1개 샘플링
+                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 GROUP BY (CAST(time AS INTEGER) / 600), category)", params![(now - 86400).to_string(), (now - 604800).to_string()]);
+                    
+                    // 3. 1시간(3600초) ~ 1일(86400초) 사이: 1분(60초)당 1개 샘플링
+                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 GROUP BY (CAST(time AS INTEGER) / 60), category)", params![(now - 3600).to_string(), (now - 86400).to_string()]);
+                    
+                    // 주의: '현재 ~ 1시간 이전(now - 3600 이상)'에 대한 삭제 쿼리는 아예 없으므로 100% 안전하게 원본이 보존됩니다!
+
                     let _ = conn.execute("VACUUM", []);
                 }
             }
