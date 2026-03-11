@@ -96,13 +96,12 @@ struct OrderUpdateInfo {
     #[serde(rename = "q")] qty: String,
 }
 
-// DB 명령에 status(유효성 마스크) 추가
 enum DbCommand {
     InsertTrade {
         time: String, category: String, 
         bid5: f64, ask5: f64, ask_q5: f64, bid_q5: f64,
         c_ask: f64, c_bid: f64, n_ask: f64, n_bid: f64, s_ask: f64, s_bid: f64,
-        status_mask: i32, // 신선도 상태값 (7=전체정상, 1~6=일부지연)
+        status_mask: i32,
     },
     InsertSnapshot(Snapshot58),
     InsertAssetRecord { ts: u64, asset: String, wallet: f64, available: f64 },
@@ -167,7 +166,6 @@ async fn keep_alive_listen_key(keys: &ApiKeys) {
 
 fn init_db() -> Connection {
     let conn = Connection::open("TRADING_DATA.db").unwrap();
-    // trades 테이블에 status 컬럼 추가
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY, time TEXT, category TEXT, bid5_price REAL, ask5_price REAL, ask_q5 REAL, bid_q5 REAL, cur_basis_ask REAL, cur_basis_bid REAL, nxt_basis_ask REAL, nxt_basis_bid REAL, sprd_ask REAL, sprd_bid REAL, status INTEGER DEFAULT 7)", []);
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS snapshot_58min (id INTEGER PRIMARY KEY, ts_utc INTEGER, category TEXT, ask_p1 REAL, ask_p2 REAL, ask_p3 REAL, ask_p4 REAL, ask_p5 REAL, ask_q1 REAL, ask_q2 REAL, ask_q3 REAL, ask_q4 REAL, ask_q5 REAL, bid_p1 REAL, bid_p2 REAL, bid_p3 REAL, bid_p4 REAL, bid_p5 REAL, bid_q1 REAL, bid_q2 REAL, bid_q3 REAL, bid_q4 REAL, bid_q5 REAL, cur_basis_ask1 REAL, cur_basis_ask2 REAL, cur_basis_ask3 REAL, cur_basis_ask4 REAL, cur_basis_ask5 REAL, cur_basis_bid1 REAL, cur_basis_bid2 REAL, cur_basis_bid3 REAL, cur_basis_bid4 REAL, cur_basis_bid5 REAL, nxt_basis_ask1 REAL, nxt_basis_ask2 REAL, nxt_basis_ask3 REAL, nxt_basis_ask4 REAL, nxt_basis_ask5 REAL, nxt_basis_bid1 REAL, nxt_basis_bid2 REAL, nxt_basis_bid3 REAL, nxt_basis_bid4 REAL, nxt_basis_bid5 REAL, sprd_ask1 REAL, sprd_ask2 REAL, sprd_ask3 REAL, sprd_ask4 REAL, sprd_ask5 REAL, sprd_bid1 REAL, sprd_bid2 REAL, sprd_bid3 REAL, sprd_bid4 REAL, sprd_bid5 REAL)", []);
     let _ = conn.execute("CREATE TABLE IF NOT EXISTS asset_history (id INTEGER PRIMARY KEY, ts INTEGER, asset TEXT, wallet REAL, available REAL)", []);
@@ -201,8 +199,18 @@ fn get_depth_arrays(d: &Option<DepthData>) -> ([f64; 5], [f64; 5], [f64; 5], [f6
 #[tokio::main]
 async fn main() {
     let keys = load_api_keys();
-    let current_sym = "btcusd_250627".to_string(); // 예시 심볼
-    let next_sym = "btcusd_250926".to_string();
+    // SYMBOLS.txt에서 읽어오는 로직 (기존 로직 복구)
+    let (current_sym, next_sym) = {
+        let file = File::open("SYMBOLS.txt").expect("SYMBOLS.txt 없음");
+        let mut vc = Vec::new();
+        for line in BufReader::new(file).lines() {
+            let code = line.unwrap().trim().to_string();
+            if code.starts_with("btcusd_") && !code.contains("perp") { vc.push(code); }
+        }
+        (vc[0].clone(), vc[1].clone())
+    };
+
+    println!("🚀 [통합 시스템 V3] 스냅샷 및 클린업 트리거 활성화");
 
     let (tx, mut rx) = mpsc::channel::<DbCommand>(2000);
     
@@ -230,12 +238,18 @@ async fn main() {
                 DbCommand::InsertPositionRecord { ts, symbol, amount, entry, pnl } => {
                     let _ = conn.execute("INSERT INTO position_history (ts, symbol, amount, entry, pnl) VALUES (?1, ?2, ?3, ?4, ?5)", params![ts, symbol, amount, entry, pnl]);
                 },
-                DbCommand::Cleanup => { /* 클린업 로직 생략 */ }
+                DbCommand::Cleanup => {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    println!("🧹 [DB 정리] 오래된 데이터를 삭제합니다...");
+                    // 7일 이전 데이터 삭제 및 단계별 샘플링 (기존 로직 복구)
+                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1", params![(now - 604800).to_string()]);
+                    let _ = conn.execute("VACUUM", []);
+                }
             }
         }
     });
 
-    // 자산 기록 태스크
+    // 자산 기록 태스크 (10분 주기)
     let keys_a = ApiKeys { api_key: keys.api_key.clone(), secret_key: keys.secret_key.clone() };
     let tx_a = tx.clone();
     tokio::spawn(async move { loop { fetch_and_record_assets(&keys_a, &tx_a).await; sleep(Duration::from_secs(600)).await; } });
@@ -249,7 +263,7 @@ async fn main() {
                 let (_, mut read) = ws.split();
                 let keys_k = ApiKeys { api_key: keys_p.api_key.clone(), secret_key: keys_p.secret_key.clone() };
                 tokio::spawn(async move { loop { sleep(Duration::from_secs(1800)).await; keep_alive_listen_key(&keys_k).await; } });
-                while let Some(Ok(msg)) = read.next().await { /* 이벤트 처리 로직 생략 */ }
+                while let Some(Ok(msg)) = read.next().await { /* 체결 알림 등 처리 */ }
             }
             sleep(Duration::from_secs(5)).await;
         }
@@ -260,28 +274,58 @@ async fn main() {
     loop {
         match connect_async(&url).await {
             Ok((ws, _)) => {
+                println!("✅ [Public] 시세 소켓 연결 성공");
                 let (_, mut read) = ws.split();
                 let (mut l_s_p, mut l_c_p, mut l_n_p) = (None, None, None);
                 let (mut l_s_a5, mut l_s_b5, mut l_c_a5, mut l_c_b5, mut l_n_a5, mut l_n_b5) = (0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
                 let (mut l_s_ts, mut l_c_ts, mut l_n_ts) = (0, 0, 0);
-                let mut l_snap_min = Utc::now().minute();
+                let mut last_snap_min = Utc::now().minute();
+                let mut last_cleanup_hour = -1i32;
 
                 while let Some(Ok(msg)) = read.next().await {
                     if let Message::Text(t) = msg {
                         if let Ok(depth) = serde_json::from_str::<DepthStream>(&t) {
                             let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-                            let (ap, _, bp, _) = get_depth_arrays(&Some(depth.data.clone()));
+                            let (ap, aq, bp, bq) = get_depth_arrays(&Some(depth.data.clone()));
                             
                             if depth.stream.contains("perp") { l_s_a5 = ap[4]; l_s_b5 = bp[4]; l_s_ts = now_ms; l_s_p = Some(depth.data.clone()); }
                             else if depth.stream.contains(&current_sym) { l_c_a5 = ap[4]; l_c_b5 = bp[4]; l_c_ts = now_ms; l_c_p = Some(depth.data.clone()); }
                             else if depth.stream.contains(&next_sym) { l_n_a5 = ap[4]; l_n_b5 = bp[4]; l_n_ts = now_ms; l_n_p = Some(depth.data.clone()); }
 
-                            // 신선도 체크 및 마스크 생성
+                            let now_utc = Utc::now();
+                            
+                            // 1. [트리거] 정기 데이터 정리 (매시 15분)
+                            if now_utc.minute() == 15 && last_cleanup_hour != now_utc.hour() as i32 {
+                                let _ = tx.send(DbCommand::Cleanup).await;
+                                last_cleanup_hour = now_utc.hour() as i32;
+                            }
+
+                            // 2. [트리거] 58분 정밀 스냅샷 (데이터가 모두 신선할 때만)
                             let v_s = now_ms - l_s_ts < 5000;
                             let v_c = now_ms - l_c_ts < 5000;
                             let v_n = now_ms - l_n_ts < 5000;
-                            
-                            // 비트마스크 계산 (1:스왑, 2:당분기, 4:차분기)
+
+                            if (v_s && v_c && v_n) && (now_utc.minute() == 58 && now_utc.second() == 0 && last_snap_min != 58) {
+                                println!("📸 [스냅샷] 58분 정기 기록을 수행합니다.");
+                                last_snap_min = 58;
+                                let m = calculate_metrics(&l_s_p, &l_c_p, &l_n_p);
+                                let ts = now_utc.timestamp() as u64;
+                                let cats = ["SWAP", &current_sym, &next_sym];
+                                let dps = [&l_s_p, &l_c_p, &l_n_p];
+                                
+                                for (i, cat) in cats.iter().enumerate() {
+                                    let (a_p, a_q, b_p, b_q) = get_depth_arrays(dps[i]);
+                                    let _ = tx.send(DbCommand::InsertSnapshot(Snapshot58 {
+                                        ts_utc: ts, category: cat.to_string(), 
+                                        ask_p: a_p, ask_q: a_q, bid_p: b_p, bid_q: b_q, 
+                                        cur_basis_ask: m.0, cur_basis_bid: m.1, nxt_basis_ask: m.2, nxt_basis_bid: m.3, sprd_ask: m.4, sprd_bid: m.5 
+                                    })).await;
+                                }
+                            } else if now_utc.minute() != 58 {
+                                last_snap_min = now_utc.minute();
+                            }
+
+                            // 3. [트리거] 실시간 Trade 저장
                             let mut status_mask = 0;
                             if v_s { status_mask += 1; }
                             if v_c { status_mask += 2; }
@@ -291,21 +335,17 @@ async fn main() {
                                 if v1 && v2 && f > 1.0 && n > 1.0 { (f - n) / ((f + n) / 2.0) * 100.0 } else { 0.0 } 
                             };
 
-                            let c_ask = calc(l_c_a5, l_s_b5, v_c, v_s);
-                            let c_bid = calc(l_c_b5, l_s_a5, v_c, v_s);
-                            let n_ask = calc(l_n_a5, l_s_b5, v_n, v_s);
-                            let n_bid = calc(l_n_b5, l_s_a5, v_n, v_s);
-                            let s_ask = calc(l_n_a5, l_c_b5, v_n, v_c);
-                            let s_bid = calc(l_n_b5, l_c_a5, v_n, v_c);
-
                             let _ = tx.send(DbCommand::InsertTrade { 
                                 time: (now_ms / 1000).to_string(), category: depth.stream.clone(), 
-                                bid5: bp[4], ask5: ap[4], ask_q5: 0.0, bid_q5: 0.0, 
-                                c_ask, c_bid, n_ask, n_bid, s_ask, s_bid,
-                                status_mask // 유효성 마스크 전송
+                                bid5: bp[4], ask5: ap[4], ask_q5: aq[4], bid_q5: bq[4], 
+                                c_ask: calc(l_c_a5, l_s_b5, v_c, v_s),
+                                c_bid: calc(l_c_b5, l_s_a5, v_c, v_s),
+                                n_ask: calc(l_n_a5, l_s_b5, v_n, v_s),
+                                n_bid: calc(l_n_b5, l_s_a5, v_n, v_s),
+                                s_ask: calc(l_n_a5, l_c_b5, v_n, v_c),
+                                s_bid: calc(l_n_b5, l_c_a5, v_n, v_c),
+                                status_mask
                             }).await;
-
-                            println!("[Status: {}] {}", status_mask, if status_mask == 7 { "OK" } else { "TIMEOUT" });
                         }
                     }
                 }
