@@ -7,6 +7,7 @@ use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use rusqlite::{params, Connection, ToSql};
 use chrono::{Timelike, Utc};
 use tokio::sync::mpsc;
+use tokio::time::{sleep, Duration};
 
 #[derive(Debug, Deserialize, Clone)]
 struct DepthStream {
@@ -128,15 +129,15 @@ fn get_active_symbols() -> (String, String) {
 #[tokio::main]
 async fn main() {
     let (current, next) = get_active_symbols();
-    println!("🚀 [시스템 가동] 비동기 수집/저장 분리 및 방어 로직 모드");
+    println!("🚀 [시스템 가동] 비동기 채널 + 자동 재접속 + 방어 로직 모드");
 
-    // DB 채널 설정 (버퍼 2000개로 넉넉하게 설정)
+    // DB 채널 설정 (버퍼 2000개)
     let (tx, mut rx) = mpsc::channel::<DbCommand>(2000);
 
     // [저장 담당] 백그라운드 태스크
     tokio::task::spawn_blocking(move || {
         let mut conn = init_db();
-        println!("💾 [저장기] DB 엔진 연결 완료");
+        println!("💾 [저장기] DB 엔진 연결 및 가동 완료");
 
         while let Some(cmd) = rx.blocking_recv() {
             match cmd {
@@ -171,86 +172,98 @@ async fn main() {
         }
     });
 
-    // 가동 시 즉시 정리 명령 전송
+    // 시작 시 정리 명령 즉시 전송
     let _ = tx.send(DbCommand::Cleanup).await;
 
-    // [수집 담당] 메인 루프
     let url = format!("wss://dstream.binance.com/stream?streams=btcusd_perp@depth5/{}@depth5/{}@depth5", current, next);
-    let (ws_stream, _) = connect_async(&url).await.expect("연결 실패");
-    let (_, mut read) = ws_stream.split();
 
-    let (mut last_swap_ask5, mut last_swap_bid5) = (0.0, 0.0);
-    let (mut last_curr_ask5, mut last_curr_bid5) = (0.0, 0.0);
-    let (mut last_next_ask5, mut last_next_bid5) = (0.0, 0.0);
-    let (mut last_swap_ts, mut last_curr_ts, mut last_next_ts) = (0u64, 0u64, 0u64);
-    let (mut last_swap_depth, mut last_curr_depth, mut last_next_depth) = (None, None, None);
-    let mut last_snapshot_min = Utc::now().minute();
-    let mut last_cleanup_hour = -1i32;
-    let mut is_first_run = true;
+    // [수집 담당] 메인 재접속 루프
+    loop {
+        match connect_async(&url).await {
+            Ok((ws_stream, _)) => {
+                println!("✅ 바이낸스 웹소켓 연결 성공");
+                let (_, mut read) = ws_stream.split();
 
-    while let Some(Ok(msg)) = read.next().await {
-        if let Message::Text(text) = msg {
-            if let Ok(depth) = serde_json::from_str::<DepthStream>(&text) {
-                let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
-                let (ap, aq, bp, bq) = get_depth_arrays(&Some(depth.data.clone()));
-                
-                if depth.stream.contains("perp") { 
-                    last_swap_bid5 = bp[4]; last_swap_ask5 = ap[4];
-                    last_swap_ts = now_ms; last_swap_depth = Some(depth.data.clone()); 
-                } else if depth.stream.contains(&current) { 
-                    last_curr_bid5 = bp[4]; last_curr_ask5 = ap[4];
-                    last_curr_ts = now_ms; last_curr_depth = Some(depth.data.clone()); 
-                } else if depth.stream.contains(&next) { 
-                    last_next_bid5 = bp[4]; last_next_ask5 = ap[4];
-                    last_next_ts = now_ms; last_next_depth = Some(depth.data.clone()); 
-                }
+                let (mut last_swap_ask5, mut last_swap_bid5) = (0.0, 0.0);
+                let (mut last_curr_ask5, mut last_curr_bid5) = (0.0, 0.0);
+                let (mut last_next_ask5, mut last_next_bid5) = (0.0, 0.0);
+                let (mut last_swap_ts, mut last_curr_ts, mut last_next_ts) = (0u64, 0u64, 0u64);
+                let (mut last_swap_depth, mut last_curr_depth, mut last_next_depth) = (None, None, None);
+                let mut last_snapshot_min = Utc::now().minute();
+                let mut last_cleanup_hour = -1i32;
+                let mut is_first_run = true;
 
-                let now_utc = Utc::now();
-                if now_utc.minute() == 15 && last_cleanup_hour != now_utc.hour() as i32 {
-                    let _ = tx.send(DbCommand::Cleanup).await;
-                    last_cleanup_hour = now_utc.hour() as i32;
-                }
+                while let Some(Ok(msg)) = read.next().await {
+                    if let Message::Text(text) = msg {
+                        if let Ok(depth) = serde_json::from_str::<DepthStream>(&text) {
+                            let now_ms = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_millis() as u64;
+                            let (ap, aq, bp, bq) = get_depth_arrays(&Some(depth.data.clone()));
+                            
+                            if depth.stream.contains("perp") { 
+                                last_swap_bid5 = bp[4]; last_swap_ask5 = ap[4];
+                                last_swap_ts = now_ms; last_swap_depth = Some(depth.data.clone()); 
+                            } else if depth.stream.contains(&current) { 
+                                last_curr_bid5 = bp[4]; last_curr_ask5 = ap[4];
+                                last_curr_ts = now_ms; last_curr_depth = Some(depth.data.clone()); 
+                            } else if depth.stream.contains(&next) { 
+                                last_next_bid5 = bp[4]; last_next_ask5 = ap[4];
+                                last_next_ts = now_ms; last_next_depth = Some(depth.data.clone()); 
+                            }
 
-                let (v_s, v_c, v_n) = (now_ms - last_swap_ts < 5000, now_ms - last_curr_ts < 5000, now_ms - last_next_ts < 5000);
-                
-                // 58분 정기 스냅샷 처리
-                if (v_s && v_c && v_n) && (is_first_run || (now_utc.minute() == 58 && now_utc.second() == 0 && last_snapshot_min != 58)) {
-                    if now_utc.minute() == 58 { last_snapshot_min = 58; }
-                    let m = calculate_metrics(&last_swap_depth, &last_curr_depth, &last_next_depth);
-                    let ts = now_utc.timestamp() as u64;
-                    let cats = ["SWAP", &current, &next];
-                    let dps = [&last_swap_depth, &last_curr_depth, &last_next_depth];
-                    for (i, cat) in cats.iter().enumerate() {
-                        let (a_p, a_q, b_p, b_q) = get_depth_arrays(dps[i]);
-                        let _ = tx.send(DbCommand::InsertSnapshot(Snapshot58 {
-                            ts_utc: ts, category: cat.to_string(), ask_p: a_p, ask_q: a_q, bid_p: b_p, bid_q: b_q,
-                            cur_basis_ask: m.0, cur_basis_bid: m.1, nxt_basis_ask: m.2, nxt_basis_bid: m.3, sprd_ask: m.4, sprd_bid: m.5
-                        })).await;
+                            let now_utc = Utc::now();
+                            if now_utc.minute() == 15 && last_cleanup_hour != now_utc.hour() as i32 {
+                                let _ = tx.send(DbCommand::Cleanup).await;
+                                last_cleanup_hour = now_utc.hour() as i32;
+                            }
+
+                            let (v_s, v_c, v_n) = (now_ms - last_swap_ts < 5000, now_ms - last_curr_ts < 5000, now_ms - last_next_ts < 5000);
+                            
+                            // 58분 정기 스냅샷
+                            if (v_s && v_c && v_n) && (is_first_run || (now_utc.minute() == 58 && now_utc.second() == 0 && last_snapshot_min != 58)) {
+                                if now_utc.minute() == 58 { last_snapshot_min = 58; }
+                                let m = calculate_metrics(&last_swap_depth, &last_curr_depth, &last_next_depth);
+                                let ts = now_utc.timestamp() as u64;
+                                let cats = ["SWAP", &current, &next];
+                                let dps = [&last_swap_depth, &last_curr_depth, &last_next_depth];
+                                for (i, cat) in cats.iter().enumerate() {
+                                    let (a_p, a_q, b_p, b_q) = get_depth_arrays(dps[i]);
+                                    let _ = tx.send(DbCommand::InsertSnapshot(Snapshot58 {
+                                        ts_utc: ts, category: cat.to_string(), ask_p: a_p, ask_q: a_q, bid_p: b_p, bid_q: b_q,
+                                        cur_basis_ask: m.0, cur_basis_bid: m.1, nxt_basis_ask: m.2, nxt_basis_bid: m.3, sprd_ask: m.4, sprd_bid: m.5
+                                    })).await;
+                                }
+                                is_first_run = false;
+                            } else if now_utc.minute() != 58 { last_snapshot_min = now_utc.minute(); }
+
+                            let calc = |far: f64, near: f64, v1: bool, v2: bool| -> f64 {
+                                if v1 && v2 && far > 1.0 && near > 1.0 { (far - near) / ((far + near) / 2.0) * 100.0 } else { 0.0 }
+                            };
+
+                            let c_ask = calc(last_curr_ask5, last_swap_bid5, v_c, v_s);
+                            let c_bid = calc(last_curr_bid5, last_swap_ask5, v_c, v_s);
+                            let n_ask = calc(last_next_ask5, last_swap_bid5, v_n, v_s);
+                            let n_bid = calc(last_next_bid5, last_swap_ask5, v_n, v_s);
+                            let s_ask = calc(last_next_ask5, last_curr_bid5, v_n, v_c);
+                            let s_bid = calc(last_next_bid5, last_curr_ask5, v_n, v_c);
+
+                            // 저장 채널 전송
+                            let _ = tx.send(DbCommand::InsertTrade {
+                                time: (now_ms / 1000).to_string(), category: depth.stream.clone(),
+                                bid5: bp[4], ask5: ap[4], ask_q5: aq[4], bid_q5: bq[4],
+                                c_ask, c_bid, n_ask, n_bid, s_ask, s_bid
+                            }).await;
+
+                            print_depth_info(depth, &current, &next, v_s, v_c, v_n);
+                        }
                     }
-                    is_first_run = false;
-                } else if now_utc.minute() != 58 { last_snapshot_min = now_utc.minute(); }
-
-                let calc = |far: f64, near: f64, v1: bool, v2: bool| -> f64 {
-                    if v1 && v2 && far > 1.0 && near > 1.0 { (far - near) / ((far + near) / 2.0) * 100.0 } else { 0.0 }
-                };
-
-                let c_ask = calc(last_curr_ask5, last_swap_bid5, v_c, v_s);
-                let c_bid = calc(last_curr_bid5, last_swap_ask5, v_c, v_s);
-                let n_ask = calc(last_next_ask5, last_swap_bid5, v_n, v_s);
-                let n_bid = calc(last_next_bid5, last_swap_ask5, v_n, v_s);
-                let s_ask = calc(last_next_ask5, last_curr_bid5, v_n, v_c);
-                let s_bid = calc(last_next_bid5, last_curr_ask5, v_n, v_c);
-
-                // 실시간 지표 채널 전송 (저장 요청)
-                let _ = tx.send(DbCommand::InsertTrade {
-                    time: (now_ms / 1000).to_string(), category: depth.stream.clone(),
-                    bid5: bp[4], ask5: ap[4], ask_q5: aq[4], bid_q5: bq[4],
-                    c_ask, c_bid, n_ask, n_bid, s_ask, s_bid
-                }).await;
-
-                print_depth_info(depth, &current, &next, v_s, v_c, v_n);
+                }
+                println!("⚠️ 소켓 연결 중단됨. 5초 후 재시도를 시작합니다.");
+            }
+            Err(e) => {
+                println!("❌ 연결 실패: {}. 5초 후 다시 시도합니다.", e);
             }
         }
+        sleep(Duration::from_secs(5)).await;
     }
 }
 
