@@ -6,6 +6,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use tokio_tungstenite::{connect_async, tungstenite::protocol::Message};
 use rusqlite::{params, Connection, ToSql};
 use chrono::{Timelike, Utc};
+use tokio::sync::mpsc;
 
 #[derive(Debug, Deserialize, Clone)]
 struct DepthStream {
@@ -34,6 +35,19 @@ struct Snapshot58 {
     sprd_ask: [f64; 5], sprd_bid: [f64; 5],
 }
 
+// DB 기록 명령을 위한 열거형 데이터 구조
+enum DbCommand {
+    InsertTrade {
+        time: String,
+        category: String,
+        bid5: f64, ask5: f64, ask_q5: f64, bid_q5: f64,
+        c_ask: f64, c_bid: f64, n_ask: f64, n_bid: f64, s_ask: f64, s_bid: f64,
+    },
+    InsertSnapshot(Snapshot58),
+    Cleanup,
+}
+
+// 58분 정기 스냅샷용 지표 연산 함수
 fn calculate_metrics(
     swap: &Option<DepthData>,
     curr: &Option<DepthData>,
@@ -80,31 +94,17 @@ fn get_depth_arrays(depth: &Option<DepthData>) -> ([f64; 5], [f64; 5], [f64; 5],
         let mut ask_accum = 0.0;
         for (i, v) in d.asks.iter().take(5).enumerate() {
             ask_p[i] = v[0].parse().unwrap_or(0.0);
-            ask_accum += v[1].parse::<f64>().unwrap_or(0.0);
-            ask_q[i] = ask_accum;
+            let qty: f64 = v[1].parse().unwrap_or(0.0);
+            ask_accum += qty; ask_q[i] = ask_accum;
         }
         let mut bid_accum = 0.0;
         for (i, v) in d.bids.iter().take(5).enumerate() {
             bid_p[i] = v[0].parse().unwrap_or(0.0);
-            bid_accum += v[1].parse::<f64>().unwrap_or(0.0);
-            bid_q[i] = bid_accum;
+            let qty: f64 = v[1].parse().unwrap_or(0.0);
+            bid_accum += qty; bid_q[i] = bid_accum;
         }
     }
     (ask_p, ask_q, bid_p, bid_q)
-}
-
-fn insert_snapshot(conn: &Connection, snap: &Snapshot58) {
-    let mut sql = String::from("INSERT INTO snapshot_58min (ts_utc, category, ask_p1, ask_p2, ask_p3, ask_p4, ask_p5, ask_q1, ask_q2, ask_q3, ask_q4, ask_q5, bid_p1, bid_p2, bid_p3, bid_p4, bid_p5, bid_q1, bid_q2, bid_q3, bid_q4, bid_q5, cur_basis_ask1, cur_basis_ask2, cur_basis_ask3, cur_basis_ask4, cur_basis_ask5, cur_basis_bid1, cur_basis_bid2, cur_basis_bid3, cur_basis_bid4, cur_basis_bid5, nxt_basis_ask1, nxt_basis_ask2, nxt_basis_ask3, nxt_basis_ask4, nxt_basis_ask5, nxt_basis_bid1, nxt_basis_bid2, nxt_basis_bid3, nxt_basis_bid4, nxt_basis_bid5, sprd_ask1, sprd_ask2, sprd_ask3, sprd_ask4, sprd_ask5, sprd_bid1, sprd_bid2, sprd_bid3, sprd_bid4, sprd_bid5) VALUES (?1, ?2");
-    for i in 3..=52 { sql.push_str(&format!(", ?{}", i)); }
-    sql.push_str(")");
-    let mut params: Vec<&dyn ToSql> = Vec::new();
-    params.push(&snap.ts_utc); params.push(&snap.category);
-    for v in &snap.ask_p { params.push(v); } for v in &snap.ask_q { params.push(v); }
-    for v in &snap.bid_p { params.push(v); } for v in &snap.bid_q { params.push(v); }
-    for v in &snap.cur_basis_ask { params.push(v); } for v in &snap.cur_basis_bid { params.push(v); }
-    for v in &snap.nxt_basis_ask { params.push(v); } for v in &snap.nxt_basis_bid { params.push(v); }
-    for v in &snap.sprd_ask { params.push(v); } for v in &snap.sprd_bid { params.push(v); }
-    let _ = conn.execute(&sql, rusqlite::params_from_iter(params));
 }
 
 fn init_db() -> Connection {
@@ -112,34 +112,6 @@ fn init_db() -> Connection {
     conn.execute("CREATE TABLE IF NOT EXISTS trades (id INTEGER PRIMARY KEY, time TEXT NOT NULL, category TEXT NOT NULL, bid5_price REAL, ask5_price REAL, ask_q5 REAL, bid_q5 REAL, cur_basis_ask REAL, cur_basis_bid REAL, nxt_basis_ask REAL, nxt_basis_bid REAL, sprd_ask REAL, sprd_bid REAL)", []).expect("trades 생성 실패");
     conn.execute("CREATE TABLE IF NOT EXISTS snapshot_58min (id INTEGER PRIMARY KEY, ts_utc INTEGER NOT NULL, category TEXT NOT NULL, ask_p1 REAL, ask_p2 REAL, ask_p3 REAL, ask_p4 REAL, ask_p5 REAL, ask_q1 REAL, ask_q2 REAL, ask_q3 REAL, ask_q4 REAL, ask_q5 REAL, bid_p1 REAL, bid_p2 REAL, bid_p3 REAL, bid_p4 REAL, bid_p5 REAL, bid_q1 REAL, bid_q2 REAL, bid_q3 REAL, bid_q4 REAL, bid_q5 REAL, cur_basis_ask1 REAL, cur_basis_ask2 REAL, cur_basis_ask3 REAL, cur_basis_ask4 REAL, cur_basis_ask5 REAL, cur_basis_bid1 REAL, cur_basis_bid2 REAL, cur_basis_bid3 REAL, cur_basis_bid4 REAL, cur_basis_bid5 REAL, nxt_basis_ask1 REAL, nxt_basis_ask2 REAL, nxt_basis_ask3 REAL, nxt_basis_ask4 REAL, nxt_basis_ask5 REAL, nxt_basis_bid1 REAL, nxt_basis_bid2 REAL, nxt_basis_bid3 REAL, nxt_basis_bid4 REAL, nxt_basis_bid5 REAL, sprd_ask1 REAL, sprd_ask2 REAL, sprd_ask3 REAL, sprd_ask4 REAL, sprd_ask5 REAL, sprd_bid1 REAL, sprd_bid2 REAL, sprd_bid3 REAL, sprd_bid4 REAL, sprd_bid5 REAL)", []).expect("스냅샷 생성 실패");
     conn
-}
-
-// 시장별 독립 샘플링이 적용된 정리 함수
-fn cleanup_database(conn: &Connection) -> rusqlite::Result<()> {
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
-    let (one_h, one_d, seven_d) = (3600, 86400, 604800);
-    println!("🧹 [데이터 정리] 시장별 독립 샘플링 및 최적화 실행...");
-
-    // 1. 7일 초과 데이터 완전 삭제
-    let d1 = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1", params![(now - seven_d).to_string()])?;
-
-    // 2. 1일 ~ 7일 사이: 시장(category)별 10분당 1개만 남김
-    let d2 = conn.execute(
-        "DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 
-         AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 GROUP BY (CAST(time AS INTEGER) / 600), category)",
-        params![(now - one_d).to_string(), (now - seven_d).to_string()]
-    )?;
-
-    // 3. 1시간 ~ 1일 사이: 시장(category)별 1분당 1개만 남김
-    let d3 = conn.execute(
-        "DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 
-         AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 GROUP BY (CAST(time AS INTEGER) / 60), category)",
-        params![(now - one_h).to_string(), (now - one_d).to_string()]
-    )?;
-
-    conn.execute("VACUUM", [])?;
-    println!("✅ 완료: 7일경과({}), 1-7일샘플링({}), 1시간-1일샘플링({})", d1, d2, d3);
-    Ok(())
 }
 
 fn get_active_symbols() -> (String, String) {
@@ -155,11 +127,54 @@ fn get_active_symbols() -> (String, String) {
 
 #[tokio::main]
 async fn main() {
-    let conn = init_db();
     let (current, next) = get_active_symbols();
-    println!("🚀 [통합 시스템] 시장별 독립 샘플링 모드 가동");
+    println!("🚀 [시스템 가동] 비동기 수집/저장 분리 및 방어 로직 모드");
 
-    let _ = cleanup_database(&conn);
+    // DB 채널 설정 (버퍼 2000개로 넉넉하게 설정)
+    let (tx, mut rx) = mpsc::channel::<DbCommand>(2000);
+
+    // [저장 담당] 백그라운드 태스크
+    tokio::task::spawn_blocking(move || {
+        let mut conn = init_db();
+        println!("💾 [저장기] DB 엔진 연결 완료");
+
+        while let Some(cmd) = rx.blocking_recv() {
+            match cmd {
+                DbCommand::InsertTrade { time, category, bid5, ask5, ask_q5, bid_q5, c_ask, c_bid, n_ask, n_bid, s_ask, s_bid } => {
+                    let _ = conn.execute(
+                        "INSERT INTO trades (time, category, bid5_price, ask5_price, ask_q5, bid_q5, cur_basis_ask, cur_basis_bid, nxt_basis_ask, nxt_basis_bid, sprd_ask, sprd_bid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                        params![time, category, bid5, ask5, ask_q5, bid_q5, c_ask, c_bid, n_ask, n_bid, s_ask, s_bid],
+                    );
+                },
+                DbCommand::InsertSnapshot(snap) => {
+                    let mut sql = String::from("INSERT INTO snapshot_58min (ts_utc, category, ask_p1, ask_p2, ask_p3, ask_p4, ask_p5, ask_q1, ask_q2, ask_q3, ask_q4, ask_q5, bid_p1, bid_p2, bid_p3, bid_p4, bid_p5, bid_q1, bid_q2, bid_q3, bid_q4, bid_q5, cur_basis_ask1, cur_basis_ask2, cur_basis_ask3, cur_basis_ask4, cur_basis_ask5, cur_basis_bid1, cur_basis_bid2, cur_basis_bid3, cur_basis_bid4, cur_basis_bid5, nxt_basis_ask1, nxt_basis_ask2, nxt_basis_ask3, nxt_basis_ask4, nxt_basis_ask5, nxt_basis_bid1, nxt_basis_bid2, nxt_basis_bid3, nxt_basis_bid4, nxt_basis_bid5, sprd_ask1, sprd_ask2, sprd_ask3, sprd_ask4, sprd_ask5, sprd_bid1, sprd_bid2, sprd_bid3, sprd_bid4, sprd_bid5) VALUES (?1, ?2");
+                    for i in 3..=52 { sql.push_str(&format!(", ?{}", i)); }
+                    sql.push_str(")");
+                    let mut p: Vec<&dyn ToSql> = Vec::new();
+                    p.push(&snap.ts_utc); p.push(&snap.category);
+                    for v in &snap.ask_p { p.push(v); } for v in &snap.ask_q { p.push(v); }
+                    for v in &snap.bid_p { p.push(v); } for v in &snap.bid_q { p.push(v); }
+                    for v in &snap.cur_basis_ask { p.push(v); } for v in &snap.cur_basis_bid { p.push(v); }
+                    for v in &snap.nxt_basis_ask { p.push(v); } for v in &snap.nxt_basis_bid { p.push(v); }
+                    for v in &snap.sprd_ask { p.push(v); } for v in &snap.sprd_bid { p.push(v); }
+                    let _ = conn.execute(&sql, rusqlite::params_from_iter(p));
+                },
+                DbCommand::Cleanup => {
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs();
+                    println!("🧹 [정리] 시장별 독립 샘플링 수행 중...");
+                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1", params![(now - 604800).to_string()]);
+                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 GROUP BY (CAST(time AS INTEGER) / 600), category)", params![(now - 86400).to_string(), (now - 604800).to_string()]);
+                    let _ = conn.execute("DELETE FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 AND id NOT IN (SELECT MIN(id) FROM trades WHERE CAST(time AS INTEGER) < ?1 AND CAST(time AS INTEGER) >= ?2 GROUP BY (CAST(time AS INTEGER) / 60), category)", params![(now - 3600).to_string(), (now - 86400).to_string()]);
+                    let _ = conn.execute("VACUUM", []);
+                }
+            }
+        }
+    });
+
+    // 가동 시 즉시 정리 명령 전송
+    let _ = tx.send(DbCommand::Cleanup).await;
+
+    // [수집 담당] 메인 루프
     let url = format!("wss://dstream.binance.com/stream?streams=btcusd_perp@depth5/{}@depth5/{}@depth5", current, next);
     let (ws_stream, _) = connect_async(&url).await.expect("연결 실패");
     let (_, mut read) = ws_stream.split();
@@ -192,22 +207,25 @@ async fn main() {
 
                 let now_utc = Utc::now();
                 if now_utc.minute() == 15 && last_cleanup_hour != now_utc.hour() as i32 {
-                    let _ = cleanup_database(&conn); last_cleanup_hour = now_utc.hour() as i32;
+                    let _ = tx.send(DbCommand::Cleanup).await;
+                    last_cleanup_hour = now_utc.hour() as i32;
                 }
 
                 let (v_s, v_c, v_n) = (now_ms - last_swap_ts < 5000, now_ms - last_curr_ts < 5000, now_ms - last_next_ts < 5000);
+                
+                // 58분 정기 스냅샷 처리
                 if (v_s && v_c && v_n) && (is_first_run || (now_utc.minute() == 58 && now_utc.second() == 0 && last_snapshot_min != 58)) {
                     if now_utc.minute() == 58 { last_snapshot_min = 58; }
-                    let metrics = calculate_metrics(&last_swap_depth, &last_curr_depth, &last_next_depth);
+                    let m = calculate_metrics(&last_swap_depth, &last_curr_depth, &last_next_depth);
                     let ts = now_utc.timestamp() as u64;
-                    let categories = ["SWAP", &current, &next];
-                    let depths = [&last_swap_depth, &last_curr_depth, &last_next_depth];
-                    for (i, cat) in categories.iter().enumerate() {
-                        let (a_p, a_q, b_p, b_q) = get_depth_arrays(depths[i]);
-                        insert_snapshot(&conn, &Snapshot58 {
+                    let cats = ["SWAP", &current, &next];
+                    let dps = [&last_swap_depth, &last_curr_depth, &last_next_depth];
+                    for (i, cat) in cats.iter().enumerate() {
+                        let (a_p, a_q, b_p, b_q) = get_depth_arrays(dps[i]);
+                        let _ = tx.send(DbCommand::InsertSnapshot(Snapshot58 {
                             ts_utc: ts, category: cat.to_string(), ask_p: a_p, ask_q: a_q, bid_p: b_p, bid_q: b_q,
-                            cur_basis_ask: metrics.0, cur_basis_bid: metrics.1, nxt_basis_ask: metrics.2, nxt_basis_bid: metrics.3, sprd_ask: metrics.4, sprd_bid: metrics.5
-                        });
+                            cur_basis_ask: m.0, cur_basis_bid: m.1, nxt_basis_ask: m.2, nxt_basis_bid: m.3, sprd_ask: m.4, sprd_bid: m.5
+                        })).await;
                     }
                     is_first_run = false;
                 } else if now_utc.minute() != 58 { last_snapshot_min = now_utc.minute(); }
@@ -216,16 +234,20 @@ async fn main() {
                     if v1 && v2 && far > 1.0 && near > 1.0 { (far - near) / ((far + near) / 2.0) * 100.0 } else { 0.0 }
                 };
 
-                let cur_basis_ask = calc(last_curr_ask5, last_swap_bid5, v_c, v_s);
-                let cur_basis_bid = calc(last_curr_bid5, last_swap_ask5, v_c, v_s);
-                let nxt_basis_ask = calc(last_next_ask5, last_swap_bid5, v_n, v_s);
-                let nxt_basis_bid = calc(last_next_bid5, last_swap_ask5, v_n, v_s);
-                let sprd_ask = calc(last_next_ask5, last_curr_bid5, v_n, v_c);
-                let sprd_bid = calc(last_next_bid5, last_curr_ask5, v_n, v_c);
+                let c_ask = calc(last_curr_ask5, last_swap_bid5, v_c, v_s);
+                let c_bid = calc(last_curr_bid5, last_swap_ask5, v_c, v_s);
+                let n_ask = calc(last_next_ask5, last_swap_bid5, v_n, v_s);
+                let n_bid = calc(last_next_bid5, last_swap_ask5, v_n, v_s);
+                let s_ask = calc(last_next_ask5, last_curr_bid5, v_n, v_c);
+                let s_bid = calc(last_next_bid5, last_curr_ask5, v_n, v_c);
 
-                let now_ts = (now_ms / 1000).to_string();
-                let _ = conn.execute("INSERT INTO trades (time, category, bid5_price, ask5_price, ask_q5, bid_q5, cur_basis_ask, cur_basis_bid, nxt_basis_ask, nxt_basis_bid, sprd_ask, sprd_bid) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-                    params![now_ts, depth.stream, bp[4], ap[4], aq[4], bq[4], cur_basis_ask, cur_basis_bid, nxt_basis_ask, nxt_basis_bid, sprd_ask, sprd_bid]);
+                // 실시간 지표 채널 전송 (저장 요청)
+                let _ = tx.send(DbCommand::InsertTrade {
+                    time: (now_ms / 1000).to_string(), category: depth.stream.clone(),
+                    bid5: bp[4], ask5: ap[4], ask_q5: aq[4], bid_q5: bq[4],
+                    c_ask, c_bid, n_ask, n_bid, s_ask, s_bid
+                }).await;
+
                 print_depth_info(depth, &current, &next, v_s, v_c, v_n);
             }
         }
