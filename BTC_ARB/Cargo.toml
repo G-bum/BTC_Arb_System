@@ -1,13 +1,31 @@
 [package]
-name = "btc_arbitrage"
+name = "btc_arb"
 version = "0.1.0"
 edition = "2021"
 
 [dependencies]
+# 비동기 실행 환경 및 채널
 tokio = { version = "1", features = ["full"] }
-tokio-tungstenite = { version = "0.20.1", features = ["native-tls"] }
 futures-util = "0.3"
+
+# 웹소켓 및 HTTP 통신
+tokio-tungstenite = { version = "0.20", features = ["native-tls"] }
+reqwest = { version = "0.11", features = ["json"] }
+
+# 데이터 변환 및 파싱
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# 데이터베이스
 rusqlite = { version = "0.31.0", features = ["bundled"] }
-chrono = "0.4"
+
+# 시간 처리
+chrono = { version = "0.4", features = ["serde"] }
+
+# 암호화 및 인증 (추가됨)
+hmac = "0.12"
+sha2 = "0.10"
+hex = "0.4"
+
+# 에러 관리
+anyhow = "1.0"
